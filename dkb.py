@@ -1,11 +1,9 @@
-#!/usr/bin/env python2
-# -*- coding: utf-8 -*-
-# DKB Credit card transaction QIF exporter
-# Copyright (C) 2013 Christian Hoffmann <mail@hoffmann-christian.info>
+#!/usr/bin/env python3
+# DKB Credit and Giro Exporter
+# Copyright (C) 2019 Thies Gerken <thies@thiesgerken.de>
 #
-# Inspired by Jens Herrmann <jens.herrmann@qoli.de>,
-# but written using modern tools (argparse, csv reader, mechanize,
-# BeautifulSoup)
+# Based on DKB Credit card transaction QIF exporter <https://github.com/hoffie/dkb-visa>
+# Copyright (C) 2013 Christian Hoffmann <mail@hoffmann-christian.info>
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as
@@ -20,6 +18,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+import unittest
 import re
 import os
 import csv
@@ -28,6 +27,7 @@ import pickle
 import logging
 import mechanize
 import time
+
 
 class RecordingBrowser(mechanize.Browser):
     _recording_path = None
@@ -46,8 +46,17 @@ class RecordingBrowser(mechanize.Browser):
     def open(self, *args, **kwargs):
         return self._intercept_call('open', *args, **kwargs)
 
-    def _intercept_call(self, method, *args, **kwargs):
+    def back(self):
+        if self._playback_enabled:
+            self._intercept_count += 1
+            return self._read_recording()
+        else:
+            mechanize.Browser.back(self)
 
+            if self._recording_enabled:
+                self._do_record()
+
+    def _intercept_call(self, method, *args, **kwargs):
         if self._playback_enabled:
             self._intercept_count += 1
             return self._read_recording()
@@ -74,16 +83,17 @@ class RecordingBrowser(mechanize.Browser):
         data['url'] = resp.geturl()
 
         self._intercept_count += 1
-        dump_path = '%s/%d.json' % (self._recording_path, self._intercept_count)
+        dump_path = '%s/%d.json' % (self._recording_path,
+                                    self._intercept_count)
         with open(dump_path, 'wb') as f:
             pickle.dump(data, f)
 
     def _read_recording(self):
-        dump_path = '%s/%d.json' % (self._recording_path, self._intercept_count)
+        dump_path = '%s/%d.json' % (self._recording_path,
+                                    self._intercept_count)
         if not os.path.exists(dump_path):
             return
-            self._intercept_count += 1
-            dump_path = '%s/%d.json' % (self._recording_path, self._intercept_count)
+
         with open(dump_path, 'rb') as f:
             data = pickle.load(f)
             if not data:
@@ -95,16 +105,21 @@ class RecordingBrowser(mechanize.Browser):
 
 logger = logging.getLogger(__name__)
 
-class DkbScraper(object):
-    BASEURL = "https://www.dkb.de/-"
 
-    def __init__(self, record_html=False, playback_html=False):
+class DkbScraper(object):
+
+    def __init__(self, record_html=False, playback_html=False, interactive=True):
         self.br = RecordingBrowser()
         dump_path = os.path.join(os.path.dirname(__file__), 'dumps')
         if record_html:
+            if not os.path.exists(dump_path):
+                os.mkdir(dump_path)
+
             self.br.enable_recording(dump_path)
         if playback_html:
             self.br.enable_playback(dump_path)
+
+        self.interactive = interactive
 
     def login(self, userid, pin):
         """
@@ -124,7 +139,7 @@ class DkbScraper(object):
         # long (infinite?) sleep() call
         br.set_handle_refresh(False)
 
-        br.open(self.BASEURL + '?$javascript=disabled')
+        br.open('https://www.dkb.de/-?$javascript=disabled')
 
         # select login form:
         br.form = list(br.forms())[1]
@@ -138,67 +153,99 @@ class DkbScraper(object):
         br.form["screenWidth"] = "1000"
         br.form["screenHeight"] = "800"
         br.form["osName"] = "Windows"
-        response = br.submit()
-        if ("Wechseln Sie in die <strong>DKB-Banking-App</strong> und best" in response.read() ):
-            logger.debug("DKB-Banking-App detected")
-            self.confirm_app_login()
-        else:
-            logger.debug("Attempting TAN login")
-            self.confirm_tan_login()
-
-    def confirm_app_login(self):
-        br = self.br
-        # The following loop executes the verification sequence for about 2 minutes.
-        for x in range(30):
-            time.sleep(2)
-            if x >= 29:
-                print("Authentication timed out")
-                quit()
-            if not ("WAITING" in br.open('https://www.dkb.de/DkbTransactionBanking/content/LoginWithBoundDevice/LoginWithBoundDeviceProcess/confirmLogin.xhtml?$event=pollingVerification').read()):
-                break
-        br.open(self.BASEURL + "?$javascript=disabled")
-        br.select_form(name="confirmForm")
         br.submit()
+        self.confirm_login()
 
-    def confirm_tan_login(self):
+    def confirm_login(self):
         br = self.br
-        br.form = list(br.forms())[2]
-        #FIXME we should check which page we are on...
-        try:
+        html = br.response().get_data().decode('utf-8')
+
+        if re.search("Anmeldung zum Internet-Banking", html):
+            raise RuntimeError("PIN seems to be wrong")
+
+        if re.search("Bestätigen Sie Ihre Anmeldung im Banking zusätzlich mit einer", html):
+            if not self.interactive:
+                raise RuntimeError(
+                    "TAN Required in non-interactive environment")
+
+            logger.info("TAN Required")
+
+            if self._get_tan_input_form() is None:
+                # if we don't find the tan field, we're probably at the empty form
+                logger.info("Empty TAN form, submitting.")
+                br.submit()
+                html = br.response().get_data().decode('utf-8')
+
             form = self._get_tan_input_form()
-        except RuntimeError:
-            # if we don't find the tan field, we're probably at the empty form
+            br.form = form
+
+            if form is None:
+                raise RuntimeError("Could not find TAN form")
+
+            startcode = re.search("Startcode ([0-9]{8})", html)
+            if startcode:
+                print(f'chipTAN Startcode: {startcode.group(1)}')
+
+            br.form["tan"] = self.ask_for_tan()
             br.submit()
-            form = self._get_tan_input_form()
 
-        br.form = form
-        startcode = re.search("Startcode [0-9]{8}", br.response().get_data())
-        if startcode: #using chipTAN
-            print(startcode.group())
-        #else: using dkbapp
-        # TODO check for Startcode
-        br.form["tan"] = self.ask_for_tan()
-        br.submit()
-
-        try:
             # if we find the tan field after submitting, the TAN was wrong
-            self._get_tan_input_form()
-        except RuntimeError:
-            br.open(self.BASEURL + "?$javascript=disabled")
-            return
-        raise RuntimeError("TAN seems to be wrong")
+            if not self._get_tan_input_form() is None:
+                raise RuntimeError("TAN seems to be wrong")
 
+        elif re.search("und bestätigen dort", html):
+            device = re.search(
+                "Gerät: <strong>([^<>]+)</strong>", html).group(1)
+            logger.info(
+                f"Waiting for confirmation through app on device '{device}'")
+
+            form = self._get_app_form()
+            br.form = form
+
+            if form is None:
+                raise RuntimeError("Could not find XSRFPreventionToken form")
+
+            token = br.form["XSRFPreventionToken"]
+            logger.info(f"XSRFPreventionToken: {token}")
+
+            timeout = 100
+            interval = 2
+
+            while timeout > 0:
+                br.open(
+                    'https://www.dkb.de/DkbTransactionBanking/content/LoginWithBoundDevice/LoginWithBoundDeviceProcess/confirmLogin.xhtml?$event=pollingVerification')
+
+                html = br.response().get_data().decode('utf-8')
+
+                if re.search("WAITING", html):
+                    logger.info(
+                        "Polling Verification: Waiting for Confirmation")
+                elif re.search("MAP_TO_EXIT", html):
+                    logger.info("Polling Verification: Complete")
+                    break
+
+                time.sleep(interval)
+                timeout -= interval
+
+            if timeout <= 0:
+                raise RuntimeError("Timeout for App confirmation")
+
+            request = mechanize.Request(
+                'https://www.dkb.de/DkbTransactionBanking/content/LoginWithBoundDevice/LoginWithBoundDeviceProcess/confirmLogin.xhtml')
+            br.open(
+                request, data=f'$event=next&XSRFPreventionToken={token}')
+
+        br.open("https://www.dkb.de/-?$javascript=disabled")
 
     def ask_for_tan(self):
         tan = ""
         import os
         if os.isatty(0):
             while not tan.strip():
-                tan = raw_input('TAN: ')
+                tan = input('TAN: ')
         else:
             tan = sys.stdin.read().strip()
         return tan
-
 
     def _get_tan_input_form(self):
         """
@@ -213,11 +260,24 @@ class DkbScraper(object):
             except Exception:
                 continue
 
-        raise RuntimeError("Unable to find tan input form")
+        return None
 
+    def _get_app_form(self):
+        """
+        Internal.
 
+        Returns the tan input form object (mechanize)
+        """
+        for form in self.br.forms():
+            try:
+                form.find_control(name="XSRFPreventionToken")
+                return form
+            except Exception:
+                continue
 
-    def credit_card_transactions_overview(self):
+        return None
+
+    def transactions_overview(self):
         """
         Navigates the internal browser state to the credit card
         transaction overview menu
@@ -244,7 +304,7 @@ class DkbScraper(object):
 
         raise RuntimeError("Unable to find transaction selection form")
 
-    def _select_all_transactions_from(self, form, from_date, to_date):
+    def _select_all_credit_transactions_from(self, form, from_date, to_date):
         """
         Internal.
 
@@ -276,16 +336,60 @@ class DkbScraper(object):
 
         to_item.value = to_date
 
-    def _select_credit_card(self, form, cardid):
+    def _select_all_giro_transactions_from(self, form, from_date, to_date):
         """
         Internal.
 
-        Selects the correct credit card from the dropdown menu in the
+        Checks the radio box "Alle Umsätze vom" and populates the
+        "from" and "to" with the given values.
+
+        @param mechanize.HTMLForm form
+        @param str from_date dd.mm.YYYY
+        @param str to_date dd.mm.YYYY
+        """
+
+        try:
+            radio_ctrl = form.find_control("searchPeriodRadio")
+        except Exception:
+            raise RuntimeError("Unable to find search period radio box")
+
+        all_transactions_item = None
+        for item in radio_ctrl.items:
+            if item.id.endswith(":1"):
+                all_transactions_item = item
+                break
+
+        if not all_transactions_item:
+            raise RuntimeError(
+                "Unable to find 'Zeitraum: vom' radio box")
+
+        form[radio_ctrl.name] = ["1"]  # select from/to date, not "all"
+
+        try:
+            from_item = form.find_control(name="transactionDate")
+        except Exception:
+            raise RuntimeError("Unable to find 'vom' (from) date field")
+
+        from_item.value = from_date
+
+        try:
+            to_item = form.find_control(name="toTransactionDate")
+        except Exception:
+            raise RuntimeError("Unable to find 'bis' (to) date field")
+
+        to_item.value = to_date
+
+    def _select_account(self, form, account):
+        """
+        Internal.
+
+        Selects the correct account (credit or debit) from the dropdown menu in the
         transaction selection form.
 
         @param mechanize.HTMLForm form
-        @param str cardid: last 4 digits of the relevant card number
+        @param str account: text of the relevant label
         """
+
         try:
             cc_list = form.find_control(name="slAllAccounts", type='select')
         except Exception:
@@ -294,35 +398,88 @@ class DkbScraper(object):
         for item in cc_list.get_items():
             # find right credit card...
             for label in item.get_labels():
-                pattern = r'\b\S{12}(?<=%s)\b' % re.escape(cardid)
-                if re.search(pattern, label.text, re.I):
+                if label.text == account:
                     cc_list.value = [item.name]
                     return
 
-        raise RuntimeError("Unable to find the right credit card")
+        raise RuntimeError("Unable to find the right account")
 
+    def list_accounts(self):
+        """
+        List credit cards and debit accounts
+        """
+        br = self.br
+        br.form = form = self._get_transaction_selection_form()
 
-    def select_transactions(self, cardid, from_date, to_date):
+        try:
+            cc_list = form.find_control(name="slAllAccounts", type='select')
+        except Exception:
+            raise RuntimeError("Unable to find credit card selection form")
+
+        c_accs = []
+        d_accs = []
+
+        for item in cc_list.get_items():
+            for label in item.get_labels():
+                if label.text.endswith('Kreditkarte'):
+                    c_accs.append(label.text)
+                elif label.text.endswith('Girokonto'):
+                    d_accs.append(label.text)
+                else:
+                    print(f'Warning: Unknown account type: \'{label.text}\'')
+
+        return c_accs, d_accs
+
+    def select_credit_card_transactions(self, label, from_date, to_date):
         """
         Changes the current view to show all transactions between
         from_date and to_date for the credit card identified by the
         given card id.
 
-        @param str cardid: last 4 digits of your credit card's number
+        @param str label: label of the drop down
         @param str from_date dd.mm.YYYY
         @param str to_date dd.mm.YYYY
         """
         br = self.br
-        logger.info("Selecting transactions in time frame %s - %s...",
-            from_date, to_date)
+        logger.info("Selecting credit card transactions in time frame %s - %s...",
+                    from_date, to_date)
 
         br.form = form = self._get_transaction_selection_form()
-        self._select_credit_card(form, cardid)
+        # self._select_credit_card(form, label)
+        self._select_account(form, label)
         # we need to reload so that we get the credit card form:
         br.submit()
 
         br.form = form = self._get_transaction_selection_form()
-        self._select_all_transactions_from(form, from_date, to_date)
+        self._select_all_credit_transactions_from(form, from_date, to_date)
+
+        # add missing $event control
+        br.form.new_control('hidden', '$event', {'value': 'search'})
+        br.form.fixup()
+        br.submit()
+
+    def select_giro_transactions(self, label, from_date, to_date):
+        """
+        Changes the current view to show all transactions between
+        from_date and to_date for the giro account identified by the
+        given label.
+
+        @param str label: label of the drop down
+        @param str from_date dd.mm.YYYY
+        @param str to_date dd.mm.YYYY
+        """
+        br = self.br
+        logger.info("Selecting giro transactions in time frame %s - %s...",
+                    from_date, to_date)
+
+        br.form = form = self._get_transaction_selection_form()
+        # self._select_credit_card(form, label)
+        self._select_account(form, label)
+        # we need to reload so that we get the credit card form:
+        br.submit()
+
+        br.form = form = self._get_transaction_selection_form()
+        self._select_all_giro_transactions_from(form, from_date, to_date)
 
         # add missing $event control
         br.form.new_control('hidden', '$event', {'value': 'search'})
@@ -338,210 +495,55 @@ class DkbScraper(object):
         """
         logger.info("Requesting CSV data...")
         self.br.follow_link(url_regex='csv')
-        return self.br.response().read()
+        return self.br.response().read().decode('latin_1')
 
     def logout(self):
         """
         Properly ends the session.
         """
-        self.br.open(self.BASEURL + "?$javascript=disabled")
+        logger.info("Logging out")
+        self.br.open("https://www.dkb.de/-?$javascript=disabled")
         self.br.follow_link(text='Abmelden')
 
+    def get_csv_name(self):
+        dispo = self.br.response().get('Content-Disposition', '')
 
-class DkbConverter(object):
-    """
-    A DKB transaction CSV to QIF converter
+        if not dispo.startswith('attachment; filename='):
+            raise RuntimeError("Unable to find filename")
 
-    Tested with GnuCash
-    """
+        return dispo[len("attachment; filename="):]
 
-    # The financial software's target account (such as Aktiva:VISA)
-    DEFAULT_CATEGORY = None
-
-    # QIF-internal card name
-    CREDIT_CARD_NAME = 'VISA'
-
-    # input charset
-    INPUT_CHARSET = 'latin1'
-
-    # QIF output charset
-    OUTPUT_CHARSET = 'utf-8'
-
-    # Length of the pre-amble (non-CSV headers), including the
-    # CSV head line
-    SKIP_LINES = 8
-
-    # Column Definitions: Which values can be found in which columns?
-    COL_DATE = 1
-    COL_VALUTA_DATE = 2
-    COL_DESC = 3
-    COL_VALUE = 4
-    COL_INFO = 5
-
-    # Number of fields for the line to be recognized as a valid
-    # transaction line:
-    REQUIRED_FIELDS = 5
-
-    def __init__(self, csv_text, default_category=None, cc_name=None):
-        """
-        Constructor
-
-        @param str csv_text
-        @param str default_category:
-            Category in your financial software
-            (an account such as Aktiva:Visa)
-        """
-        self.csv_text = (csv_text
-            .decode(self.INPUT_CHARSET)
-            .encode(self.OUTPUT_CHARSET))
-        self.DEFAULT_CATEGORY = default_category
-        self.CREDIT_CARD_NAME = cc_name or 'VISA'
-
-    def format_date(self, line):
-        """
-        Extracts the date from the given line and
-        converts it from DD.MM.YYYY to MM/DD/YYYY
-
-        @param list line
-        @return str
-        """
-        date_re = re.compile('.*?(\d{1,2})\.(\d{1,2})\.(\d{2,4}).*?')
-        if date_re.match(line[self.COL_VALUTA_DATE]):
-            # use valuta date if available
-            field = self.COL_VALUTA_DATE
-        else:
-            # ... default to regular date column otherwise:
-            field = self.COL_DATE
-        return date_re.sub(r'\2/\1/\3', line[field])
-
-    def format_value(self, line):
-        """
-        Extracts the value (such as 3,00 or -100,00) from the given
-        line, removes any dots and replaces the comma by a dot.
-
-        @param list line
-        @return str
-        """
-        return (line[self.COL_VALUE]
-            .strip()
-            .replace('.', '') # 1.000 -> 1000
-            .replace(',', '.')) # 0,83 -> 0.83
-
-    def format_description(self, line):
-        """
-        Extracts the description from the given line and strips
-        any whitespace.
-
-        @param list line
-        @return str
-        """
-        return line[self.COL_DESC].strip()
-
-    def format_info(self, line):
-        """
-        Extracts any additional info (such as different currencies)
-        from the given line and strips any whitespace.
-
-        @param list line
-        @return str
-        """
-        return line[self.COL_INFO].strip()
-
-    def get_category(self, line):
-        """
-        Returns the best-fitting category for the given line.
-        Currently, we always return the default category, but this would
-        be the place for guessing algorithms.
-
-        @param list line
-        @return str
-        """
-        return self.DEFAULT_CATEGORY
-
-    def get_qif_lines(self):
-        """
-        Does the actual CSV to QIF conversion and returns an iterator
-        over all required QIF lines.
-        No line separator is included.
-
-        @return iterator
-        """
-        logger.info("Running csv->qif conversion...")
-        yield '!Account'
-        yield 'N' + self.CREDIT_CARD_NAME
-        yield '^'
-        yield '!Type:Bank'
-        lines = self.csv_text.split('\n')
-        reader = csv.reader(lines, delimiter=";")
-        for x in xrange(self.SKIP_LINES):
-            reader.next()
-        for line in reader:
-            if len(line) < self.REQUIRED_FIELDS:
-                continue
-            if len(line[self.COL_VALUTA_DATE]) == 0:
-                continue
-            yield 'D%s' % self.format_date(line)
-            yield 'T%s' % self.format_value(line)
-            yield 'M%s' % self.format_description(line)
-            if line[self.COL_INFO].strip():
-                yield 'M%s' % self.format_info(line)
-            category = self.get_category(line)
-            if category:
-                yield 'L%s' % category
-            yield '^'
-
-    def export_to(self, path):
-        """
-        Writes the QIF version of the already stored csv text to the
-        given path.
-
-        @param str path
-        """
-        logger.info("Exporting qif to %s", path)
-        with open(path, "wb") as f:
-            for line in self.get_qif_lines():
-                f.write(line + "\n")
 
 if __name__ == '__main__':
     from getpass import getpass
     from argparse import ArgumentParser
-    from datetime import date
+    from datetime import date, timedelta
 
     cli = ArgumentParser()
     cli.add_argument("--userid",
-        help="Your user id (same as used for login)")
-    cli.add_argument("--cardid",
-        help="Last 4 digits of your card number")
-    cli.add_argument("--output", "-o",
-        help="Output path (QIF)")
-    cli.add_argument("--qif-account",
-        help="Default QIF account name (e.g. Aktiva:VISA)")
+                     help="Your user id (same as used for login)")
+    cli.add_argument("--output", "-o", default=".",
+                     help="Output directory for csv files")
     cli.add_argument("--from-date",
-        help="Export transactions as of... (DD.MM.YYYY)")
+                     help="Export transactions as of... (DD.MM.YYYY)",
+                     default=(date.today() - timedelta(days=180)).strftime('%d.%m.%Y'))
     cli.add_argument("--to-date",
-        help="Export transactions until... (DD.MM.YYYY)",
-        default=date.today().strftime('%d.%m.%Y'))
-    cli.add_argument("--raw", action="store_true",
-        help="Store the raw CSV file instead of QIF")
+                     help="Export transactions until... (DD.MM.YYYY)",
+                     default=date.today().strftime('%d.%m.%Y'))
     cli.add_argument("--debug", action="store_true")
+    cli.add_argument("--batch", action="store_true",
+                     help="Do not wait for TAN inputs (Only authentication through app possible)")
 
     args = cli.parse_args()
     if not args.userid:
         cli.error("Please specify a valid user id")
-    if not args.cardid:
-        cli.error("Please specify a valid card id")
-
-    level = logging.INFO
-    if args.debug:
-        level = logging.DEBUG
-    logging.basicConfig(level=level, format='%(message)s')
 
     def is_valid_date(date):
-        return date and bool(re.match('^\d{1,2}\.\d{1,2}\.\d{2,5}\Z', date))
+        return date and bool(re.match(r'^\d{1,2}\.\d{1,2}\.\d{2,5}\Z', date))
 
     from_date = args.from_date
     while not is_valid_date(from_date):
-        from_date = raw_input("Start time: ")
+        from_date = input("Start time: ")
     if not is_valid_date(args.to_date):
         cli.error("Please specify a valid end time")
     if not args.output:
@@ -555,57 +557,101 @@ if __name__ == '__main__':
     else:
         pin = sys.stdin.read().strip()
 
-    fetcher = DkbScraper(record_html=args.debug)
+    fetcher = DkbScraper(record_html=args.debug, interactive=not args.batch)
 
     if args.debug:
         logger = logging.getLogger("mechanize")
         logger.addHandler(logging.StreamHandler(sys.stdout))
         logger.setLevel(logging.INFO)
-        #fetcher.br.set_debug_http(True)
-        fetcher.br.set_debug_responses(True)
-        #fetcher.br.set_debug_redirects(True)
+        # fetcher.br.set_debug_http(True)
+        # fetcher.br.set_debug_responses(True)
+        # fetcher.br.set_debug_redirects(True)
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    logging.basicConfig(level=level, format='%(message)s')
 
     fetcher.login(args.userid, pin)
-    fetcher.credit_card_transactions_overview()
-    fetcher.select_transactions(args.cardid, from_date, args.to_date)
-    csv_text = fetcher.get_transaction_csv()
-    fetcher.logout()
+    fetcher.transactions_overview()
 
-    if args.raw:
-        if args.output == '-':
-            f = sys.stdout
-        else:
-            f = open(args.output, 'w')
+    c_accs, d_accs = fetcher.list_accounts()
+    first = True
+
+    for c in c_accs:
+        if not first:
+            fetcher.br.back()
+        first = False
+
+        fetcher.select_credit_card_transactions(c, from_date, args.to_date)
+        csv_text = fetcher.get_transaction_csv()
+        fname = os.path.join(args.output, fetcher.get_csv_name())
+        logger.info(f"Writing {fname}")
+        f = open(fname, 'w')
         f.write(csv_text)
-    else:
-        dkb2qif = DkbConverter(csv_text, cc_name=args.qif_account)
-        dkb2qif.export_to(args.output)
+
+    for d in d_accs:
+        if not first:
+            fetcher.br.back()
+        first = False
+
+        fetcher.select_giro_transactions(d, from_date, args.to_date)
+        csv_text = fetcher.get_transaction_csv()
+        fname = os.path.join(args.output, fetcher.get_csv_name())
+        logger.info(f"Writing {fname}")
+        f = open(fname, 'w')
+        f.write(csv_text)
+
+    fetcher.logout()
 
 # Testing
 # =======
 # python -m unittest dkb
 # test_fetcher will fail unless you manually create test data, see below
 
-import unittest
-class TestDkb(unittest.TestCase):
-    def test_csv(self):
-        text = open("tests/example.csv", "rb").read()
-        c = DkbConverter(text)
-        c.export_to("tests/example.qif")
 
+class TestDkb(unittest.TestCase):
     def test_fetcher(self):
         # Run with --debug to create the necessary data for the tests.
         # This will record your actual dkb.de responses for local testing.
-        f = DkbScraper(playback_html=True)
-        f.BASEURL = "http://localhost:8000/loginform.html"
-        f.br.set_debug_http(True)
-        #f.br.set_debug_responses(True)
-        f.br.set_debug_redirects(True)
+        fetcher = DkbScraper(playback_html=True)
+        # fetcher.br.set_debug_http(True)
+        # fetcher.br.set_debug_responses(True)
+        # fetcher.br.set_debug_redirects(True)
+
         logger = logging.getLogger("mechanize")
         logger.addHandler(logging.StreamHandler(sys.stdout))
         logger.setLevel(logging.INFO)
-        f.login("test", "1234")
-        f.credit_card_transactions_overview()
-        f.select_transactions("", "01.01.2013", "01.09.2013")
-        print(f.get_transaction_csv())
-        f.logout()
+
+        logging.basicConfig(level=logging.INFO, format='%(message)s')
+
+        fetcher.login("test", "1234")
+        fetcher.transactions_overview()
+        c_accs, d_accs = fetcher.list_accounts()
+
+        first = True
+
+        for c in c_accs:
+            if not first:
+                fetcher.br.back()
+            first = False
+
+            fetcher.select_credit_card_transactions(
+                c, "01.01.2013", "01.09.2013")
+            print(c)
+            print(fetcher.get_transaction_csv())
+            print(fetcher.get_csv_name())
+            print()
+
+        for d in d_accs:
+            if not first:
+                fetcher.br.back()
+            first = False
+
+            fetcher.select_giro_transactions(d, "01.01.2013", "01.09.2013")
+            print(d)
+            print(fetcher.get_transaction_csv())
+            print(fetcher.get_csv_name())
+            print()
+
+        fetcher.logout()

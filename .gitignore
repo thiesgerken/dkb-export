@@ -1,3 +1,6 @@
 *.pyc
 *.qif
+*.csv
+*.json
 dumps
+__pycache__
